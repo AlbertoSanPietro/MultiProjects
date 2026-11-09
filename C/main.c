@@ -38,7 +38,11 @@ typedef enum {
 
 typedef enum { STATEMENT_INSERT, STATEMENT_SELECT } StatementType;
 
-typedef enum { EXECUTE_SUCCESS, EXECUTE_TABLE_FULL } ExecuteResult;
+typedef enum {
+  EXECUTE_SUCCESS,
+  EXECUTE_DUPLICATE_KEY,
+  EXECUTE_TABLE_FULL
+} ExecuteResult;
 
 typedef struct {
   StatementType type;
@@ -93,12 +97,18 @@ void seralize_row(Row *src, void *dest);
 void deserialize_row(void *src, Row *dest);
 void print_leaf_node(void *node);
 Cursor *table_start(Table *table);
-Cursor *table_end(Table *table);
+Cursor *table_find(Table *table, uint32_t key);
+Cursor *leaf_node_find(Table *table, uint32_t page_num, uint32_t key);
+
+NodeType get_node_type(void *node);
+
 void print_row(Row *row);
 uint32_t *leaf_node_num_cells(void *node);
 uint32_t *leaf_node_cell(void *node, uint32_t cell_num);
 uint32_t *leaf_node_key(void *node, uint32_t cell_num);
 void *leaf_node_value(void *node, uint32_t cell_num);
+void leaf_node_split_and_insert(Cursor *cursor, uint32_t key, Row *value);
+
 void initialize_leaf_node(void *node);
 void *get_page(Pager *pager, uint32_t page_num);
 void *cursor_value(Cursor *cursor);
@@ -143,17 +153,33 @@ Cursor *table_start(Table *table) {
   return cursor;
 }
 
-Cursor *table_end(Table *table) {
-  Cursor *cursor = malloc(sizeof(Cursor));
-  cursor->table = table;
-  cursor->page_num = table->root_page_num;
+/*
+Return the position of the given key.
+If the key is not present, return the position
+where it should be inserted
+*/
+Cursor *table_find(Table *table, uint32_t key) {
+  uint32_t root_page_num = table->root_page_num;
+  void *root_node = get_page(table->pager, root_page_num);
 
-  void *root_node = get_page(table->pager, table->root_page_num);
-  uint32_t num_cells = *leaf_node_num_cells(root_node);
-  cursor->end_of_table = true;
-
-  return cursor;
+  if (get_node_type(root_node) == NODE_LEAF) {
+    return leaf_node_find(table, root_page_num, key);
+  } else {
+    printf("Need to implement searching an internal node\n");
+    exit(EXIT_FAILURE);
+  }
 }
+
+NodeType get_node_type(void *node) {
+  uint8_t value = *((uint8_t *)(node + NODE_TYPE_OFFSET));
+  return (NodeType)value;
+}
+
+void set_node_type(void *node, NodeType type) {
+  uint8_t value = type;
+  *((uint8_t *)(node + NODE_TYPE_OFFSET)) = value;
+}
+
 // B tree:
 typedef enum { NODE_INTERNAL, NODE_LEAF } NodeType;
 
@@ -201,7 +227,47 @@ void *leaf_node_value(void *node, uint32_t cell_num) {
   return leaf_node_cell(node, cell_num) + LEAF_NODE_KEY_SIZE;
 }
 
-void initialize_leaf_node(void *node) { *leaf_node_num_cells(node) = 0; }
+void initialize_leaf_node(void *node) {
+  set_node_type(node, NODE_LEAF);
+  *leaf_node_num_cells(node) = 0;
+}
+
+void leaf_node_split_and_insert(Cursor *cursor, uint32_t key, Row *value) {
+  /*
+  Create a new node and move half the cells over.
+  Insert the new value in one of the two nodes.
+  Update parent or create a new parent.
+  */
+
+  void *old_node = get_page(cursor->table->pager, cursor->page_num);
+  uint32_t new_page_num = get_unused_page_num(cursor->table->pager);
+  void *new_node = get_page(cursor->table->pager, new_page_num);
+  initialize_leaf_node(new_node);
+
+  /*
+  All existing keys plus new key should be divided
+  evenly between old (left) and new (right) nodes.
+  Starting from the right, move each key to correct position.
+  */
+  for (int32_t i = LEAF_NODE_MAX_CELLS; i >= 0; i--) {
+    void *destination_node;
+    if (i >= LEAF_NODE_LEFT_SPLIT_COUNT) {
+      destination_node = new_node;
+    } else {
+      destination_node = old_node;
+    }
+    uint32_t index_within_node = i % LEAF_NODE_LEFT_SPLIT_COUNT;
+    void *destination = leaf_node_cell(destination_node, index_within_node);
+
+    if (i == cursor->cell_num) {
+      serialize_row(value, destination);
+    } else if (i > cursor->cell_num) {
+      memcpy(destination, leaf_node_cell(old_node, i - 1), LEAF_NODE_CELL_SIZE);
+    } else {
+      memcpy(destination, leaf_node_cell(old_node, i), LEAF_NODE_CELL_SIZE);
+    }
+  }
+}
 
 void *get_page(Pager *pager, uint32_t page_num) {
   if (page_num > TABLE_MAX_PAGES) {
@@ -283,6 +349,35 @@ void read_input(InputBuffer *input_buffer) {
 void close_input_buffer(InputBuffer *input_buffer) {
   free(input_buffer->buffer);
   free(input_buffer);
+}
+
+Cursor *leaf_node_find(Table *table, uint32_t page_num, uint32_t key) {
+  void *node = get_page(table->pager, page_num);
+  uint32_t num_cells = *leaf_node_num_cells(node);
+
+  Cursor *cursor = malloc(sizeof(Cursor));
+  cursor->table = table;
+  cursor->page_num = page_num;
+
+  // Binary search
+  uint32_t min_index = 0;
+  uint32_t one_past_max_index = num_cells;
+  while (one_past_max_index != min_index) {
+    uint32_t index = (min_index + one_past_max_index) / 2;
+    uint32_t key_at_index = *leaf_node_key(node, index);
+    if (key == key_at_index) {
+      cursor->cell_num = index;
+      return cursor;
+    }
+    if (key < key_at_index) {
+      one_past_max_index = index;
+    } else {
+      min_index = index + 1;
+    }
+  }
+
+  cursor->cell_num = min_index;
+  return cursor;
 }
 
 void pager_flush(Pager *pager, uint32_t page_num) {
@@ -397,11 +492,18 @@ PrepareResult prepare_statement(InputBuffer *input_buffer,
 
 ExecuteResult execute_insert(Statement *statement, Table *table) {
   void *node = get_page(table->pager, table->root_page_num);
-  if ((*leaf_node_num_cells(node) >= LEAF_NODE_MAX_CELLS)) {
-    return EXECUTE_TABLE_FULL;
-  }
+  uint32_t num_cells = (*leaf_node_num_cells(node));
+
   Row *row_to_insert = &(statement->row_to_insert);
-  Cursor *cursor = table_end(table);
+  uint32_t key_to_insert = row_to_insert->id;
+  Cursor *cursor = table_find(table, key_to_insert);
+
+  if (cursor->cell_num < num_cells) {
+    uint32_t key_at_index = *leaf_node_key(node, cursor->cell_num);
+    if (key_at_index == key_to_insert) {
+      return EXECUTE_DUPLICATE_KEY;
+    }
+  }
 
   leaf_node_insert(cursor, row_to_insert->id, row_to_insert);
 
@@ -480,8 +582,8 @@ void leaf_node_insert(Cursor *cursor, uint32_t key, Row *value) {
   uint32_t num_cells = *leaf_node_num_cells(node);
   if (num_cells >= LEAF_NODE_MAX_CELLS) {
     // Node full
-    printf("Need to implement splitting a leaf node.\n");
-    exit(EXIT_FAILURE);
+    leaf_node_split_and_insert(cursor, key, value);
+    return;
   }
 
   if (cursor->cell_num < num_cells) {
@@ -552,6 +654,9 @@ int main(int argc, char **argv) {
     switch (execute_statement(&statement, table)) {
     case (EXECUTE_SUCCESS):
       printf("Executed.\n");
+      break;
+    case (EXECUTE_DUPLICATE_KEY):
+      printf("Error: Duplicate key.\n");
       break;
     case (EXECUTE_TABLE_FULL):
       printf("Error: Table full.\n");
